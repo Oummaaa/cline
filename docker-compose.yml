@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+    cline:
+        build: .
+        container_name: cline-web
+        ports:
+            - "8088:8088"
+        volumes:
+            - cline-data:/home/coder
+            - /:/host # Cette ligne monte tout le système de fichiers de l'hôte
+        environment:
+            - PASSWORD=cline123
+        restart: unless-stopped
+
+volumes:
+    cline-data:
