@@ -12,6 +12,8 @@ RUN ls -l /app
 RUN cd webview-ui && npm install
 RUN ls -l webview-ui
 RUN npm run package
+# Vérification des fichiers générés
+RUN ls -la /app/dist || echo "Le dossier dist n'existe pas"
 
 # Étape finale
 FROM codercom/code-server:latest
@@ -75,9 +77,19 @@ RUN apt-get update && \
 RUN mkdir -p /workspace && \
     chown -R coder:coder /workspace
 
-# Copier l'extension construite
-COPY --from=builder /app /home/coder/cline
+# Créer le dossier pour les fichiers statiques
+RUN mkdir -p /home/coder/cline/static && \
+    chown -R coder:coder /home/coder/cline
+
+# Copier l'extension construite avec une structure plus spécifique
+COPY --from=builder /app/dist /home/coder/cline/dist
+COPY --from=builder /app/static /home/coder/cline/static
+COPY --from=builder /app /home/coder/cline/src
+
 WORKDIR /home/coder/cline
+
+# S'assurer que tous les fichiers ont les bonnes permissions
+RUN chown -R coder:coder /home/coder/cline
 
 # Installer les extensions VSCode nécessaires
 RUN code-server --install-extension ms-vscode.vscode-typescript-next \
