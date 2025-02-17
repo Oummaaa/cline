@@ -10,6 +10,7 @@ import { convertToR1Format } from "../transform/r1-format"
 export class OpenAiHandler implements ApiHandler {
 	private options: ApiHandlerOptions
 	private client: OpenAI
+	private lastRequestTime: number = 0
 
 	constructor(options: ApiHandlerOptions) {
 		this.options = options
@@ -28,8 +29,20 @@ export class OpenAiHandler implements ApiHandler {
 		}
 	}
 
+	private async waitIfNeeded() {
+		const now = Date.now()
+		const timeSinceLastRequest = now - this.lastRequestTime
+		const minDelay = 30000 // 30 secondes en millisecondes
+		this.lastRequestTime = now
+
+		if (timeSinceLastRequest < minDelay) {
+			await new Promise((resolve) => setTimeout(resolve, minDelay - timeSinceLastRequest))
+		}
+	}
+
 	@withRetry()
 	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+		await this.waitIfNeeded()
 		const modelId = this.options.openAiModelId ?? ""
 		const isDeepseekReasoner = modelId.includes("deepseek-reasoner")
 

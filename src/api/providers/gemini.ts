@@ -9,6 +9,7 @@ import { ApiStream } from "../transform/stream"
 export class GeminiHandler implements ApiHandler {
 	private options: ApiHandlerOptions
 	private client: GoogleGenerativeAI
+	private lastRequestTime: number = 0
 
 	constructor(options: ApiHandlerOptions) {
 		if (!options.geminiApiKey) {
@@ -18,8 +19,20 @@ export class GeminiHandler implements ApiHandler {
 		this.client = new GoogleGenerativeAI(options.geminiApiKey)
 	}
 
+	private async waitIfNeeded() {
+		const now = Date.now()
+		const timeSinceLastRequest = now - this.lastRequestTime
+		const minDelay = 30000 // 30 secondes en millisecondes
+		this.lastRequestTime = now
+
+		if (timeSinceLastRequest < minDelay) {
+			await new Promise((resolve) => setTimeout(resolve, minDelay - timeSinceLastRequest))
+		}
+	}
+
 	@withRetry()
 	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+		await this.waitIfNeeded()
 		const model = this.client.getGenerativeModel({
 			model: this.getModel().id,
 			systemInstruction: systemPrompt,

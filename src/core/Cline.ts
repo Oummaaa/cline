@@ -59,6 +59,7 @@ import { formatResponse } from "./prompts/responses"
 import { addUserInstructions, SYSTEM_PROMPT } from "./prompts/system"
 import { getNextTruncationRange, getTruncatedMessages } from "./sliding-window"
 import { ClineProvider, GlobalFileNames } from "./webview/ClineProvider"
+import { TaskPilot } from "./task-pilot/TaskPilot"
 
 const cwd = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0) ?? path.join(os.homedir(), "Desktop") // may or may not exist but fs checking existence would immediately ask for permission which would be bad UX, need to come up with a better solution
 
@@ -69,6 +70,7 @@ type UserContent = Array<
 
 export class Cline {
 	readonly taskId: string
+	private taskPilot: TaskPilot
 	api: ApiHandler
 	private terminalManager: TerminalManager
 	private urlContentFetcher: UrlContentFetcher
@@ -124,6 +126,7 @@ export class Cline {
 		images?: string[],
 		historyItem?: HistoryItem,
 	) {
+		this.taskPilot = new TaskPilot()
 		this.clineIgnoreController = new ClineIgnoreController(cwd)
 		this.clineIgnoreController.initialize().catch((error) => {
 			console.error("Failed to initialize ClineIgnoreController:", error)
@@ -222,11 +225,31 @@ export class Cline {
 		message.conversationHistoryIndex = this.apiConversationHistory.length - 1 // NOTE: this is the index of the last added message which is the user message, and once the clinemessages have been presented we update the apiconversationhistory with the completed assistant message. This means when resetting to a message, we need to +1 this index to get the correct assistant message that this tool use corresponds to
 		message.conversationHistoryDeletedRange = this.conversationHistoryDeletedRange
 		this.clineMessages.push(message)
+
+		// Mettre à jour TaskPilot avec le nouveau message
+		if (message.type === "say" && message.say === "text" && !message.partial) {
+			// Le premier message est la tâche
+			this.taskPilot.initializeTask(message.text || "")
+		} else {
+			this.taskPilot.addTaskMessage(message)
+		}
+
 		await this.saveClineMessages()
 	}
 
 	private async overwriteClineMessages(newMessages: ClineMessage[]) {
 		this.clineMessages = newMessages
+
+		// Réinitialiser TaskPilot avec les nouveaux messages
+		const taskMessage = newMessages[0] // Le premier message est toujours la tâche
+		if (taskMessage && taskMessage.type === "say" && taskMessage.say === "text") {
+			this.taskPilot.initializeTask(taskMessage.text || "")
+			// Ajouter tous les messages suivants
+			for (let i = 1; i < newMessages.length; i++) {
+				this.taskPilot.addTaskMessage(newMessages[i])
+			}
+		}
+
 		await this.saveClineMessages()
 	}
 
@@ -665,6 +688,72 @@ export class Cline {
 			throw new Error("Cline instance aborted")
 		}
 
+		// Vérifier la complétion de la tâche après chaque completion_result
+		if (type === "completion_result" && !partial) {
+			try {
+				// Créer le message de complétion
+				const completionMessage: ClineMessage = {
+					ts: Date.now(),
+					type: "say",
+					say: type,
+					text,
+					images,
+				}
+
+				// Ajouter le message à TaskPilot
+				await this.addToClineMessages(completionMessage)
+
+				// Vérifier que le message a bien été ajouté
+				const lastMessage = this.clineMessages.at(-1)
+				if (!lastMessage || lastMessage.say !== "completion_result") {
+					throw new Error("Completion message not added correctly")
+				}
+
+				// Attendre un peu pour s'assurer que le message est bien enregistré
+				await delay(100)
+
+				// Procéder à la vérification
+				const verificationResult = await this.taskPilot.verifyTaskCompletion()
+
+				if (verificationResult.issues) {
+					// Il y a des problèmes à résoudre
+					await this.say("error", `Problèmes détectés:\n${verificationResult.issues.join("\n")}`)
+				} else {
+					// Si pas de problèmes, relancer la même tâche
+					const originalTask = this.clineMessages[0]?.text || ""
+					if (originalTask) {
+						// Créer une nouvelle instance de Cline avec la même tâche
+						const provider = this.providerRef.deref()
+						if (provider) {
+							await delay(60000) // Attendre 60 secondes
+							await provider.initClineWithTask(originalTask)
+							await this.say(
+								"text",
+								"La tâche a été vérifiée avec succès. Une nouvelle instance de la même tâche a été créée.",
+							)
+						}
+					}
+				}
+
+				if (verificationResult.nextTaskDetails) {
+					// Créer une tâche de vérification
+					const taskId = this.taskPilot.createVerificationTask(verificationResult)
+					if (taskId) {
+						const task = this.taskPilot.getVerificationTask(taskId)
+						if (task?.nextTaskDetails) {
+							await this.say(
+								"text",
+								`Tâche de vérification créée (${task.nextTaskDetails.priority}):\n${task.nextTaskDetails.description}`,
+							)
+						}
+					}
+				}
+			} catch (error) {
+				console.error("[TaskPilot] Error during completion verification:", error)
+				await this.say("error", "Une erreur est survenue lors de la vérification de la tâche")
+			}
+		}
+
 		if (partial !== undefined) {
 			const lastMessage = this.clineMessages.at(-1)
 			const isUpdatingPreviousPartial =
@@ -769,6 +858,9 @@ export class Cline {
 		await this.providerRef.deref()?.postStateToWebview()
 
 		await this.say("text", task, images)
+		if (task) {
+			this.taskPilot.initializeTask(task)
+		}
 
 		this.isInitialized = true
 
@@ -852,6 +944,13 @@ export class Cline {
 		let responseImages: string[] | undefined
 		if (response === "messageResponse") {
 			await this.say("user_feedback", text, images)
+			this.taskPilot.addTaskMessage({
+				ts: Date.now(),
+				type: "say",
+				say: "user_feedback",
+				text,
+				images,
+			})
 			responseText = text
 			responseImages = images
 		}
@@ -2679,6 +2778,33 @@ export class Cline {
 								await this.say("user_feedback", text ?? "", images)
 								pushToolResult(formatResponse.toolResult(`<answer>\n${text}\n</answer>`, images))
 
+								// Relancer la tâche avec TaskPilot
+								const originalTask = this.clineMessages[0]?.text || ""
+								if (originalTask) {
+									// Réinitialiser TaskPilot avec la tâche originale
+									this.taskPilot.initializeTask(originalTask)
+
+									// Ajouter la réponse comme nouveau message
+									const responseMessage: ClineMessage = {
+										ts: Date.now(),
+										type: "say",
+										say: "text",
+										text: `Réponse reçue: ${text}`,
+									}
+									this.taskPilot.addTaskMessage(responseMessage)
+
+									// Relancer la tâche
+									const provider = this.providerRef.deref()
+									if (provider) {
+										await delay(60000) // Attendre 60 secondes
+										await provider.initClineWithTask(originalTask)
+										await this.say(
+											"text",
+											"La tâche a été relancée avec TaskPilot suite à la réponse à la question.",
+										)
+									}
+								}
+
 								break
 							}
 						} catch (error) {
@@ -2718,6 +2844,13 @@ export class Cline {
 								if (this.didRespondToPlanAskBySwitchingMode) {
 									if (text) {
 										await this.say("user_feedback", text ?? "", images)
+										this.taskPilot.addTaskMessage({
+											ts: Date.now(),
+											type: "say",
+											say: "user_feedback",
+											text: text ?? "",
+											images,
+										})
 									}
 									pushToolResult(
 										formatResponse.toolResult(
@@ -2758,6 +2891,13 @@ export class Cline {
 							return [false, ""] // signals to recursive loop to stop (for now this never happens since yesButtonClicked will trigger a new task)
 						}
 						await this.say("user_feedback", text ?? "", images)
+		this.taskPilot.addTaskMessage({
+			ts: Date.now(),
+			type: "say",
+			say: "user_feedback",
+			text: text ?? "",
+			images
+		})
 						return [
 						*/
 						const result: string | undefined = block.params.result
@@ -2902,7 +3042,7 @@ export class Cline {
 		}
 
 		/*
-		Seeing out of bounds is fine, it means that the next too call is being built up and ready to add to assistantMessageContent to present. 
+		Seeing out of bounds is fine, it means that the next too call is being built up and ready to add to assistantMessageContent to present.
 		When you see the UI inactive during this, it means that a tool is breaking without presenting any UI. For example the write_to_file tool was breaking when relpath was undefined, and for invalid relpath it never presented UI.
 		*/
 		this.presentAssistantMessageLocked = false // this needs to be placed here, if not then calling this.presentAssistantMessage below would fail (sometimes) since it's locked

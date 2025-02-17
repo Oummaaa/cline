@@ -9,6 +9,7 @@ import { convertToR1Format } from "../transform/r1-format"
 export class QwenHandler implements ApiHandler {
 	private options: ApiHandlerOptions
 	private client: OpenAI
+	private lastRequestTime: number = 0
 
 	constructor(options: ApiHandlerOptions) {
 		this.options = options
@@ -19,6 +20,17 @@ export class QwenHandler implements ApiHandler {
 					: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
 			apiKey: this.options.qwenApiKey,
 		})
+	}
+
+	private async waitIfNeeded() {
+		const now = Date.now()
+		const timeSinceLastRequest = now - this.lastRequestTime
+		const minDelay = 30000 // 30 secondes en millisecondes
+		this.lastRequestTime = now
+
+		if (timeSinceLastRequest < minDelay) {
+			await new Promise((resolve) => setTimeout(resolve, minDelay - timeSinceLastRequest))
+		}
 	}
 
 	getModel(): { id: QwenModelId; info: ModelInfo } {
@@ -34,6 +46,7 @@ export class QwenHandler implements ApiHandler {
 	}
 
 	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+		await this.waitIfNeeded()
 		const model = this.getModel()
 		const isDeepseekReasoner = model.id.includes("deepseek-r1")
 		let openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [

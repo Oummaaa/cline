@@ -18,6 +18,7 @@ import { ApiStream } from "../transform/stream"
 export class MistralHandler implements ApiHandler {
 	private options: ApiHandlerOptions
 	private client: Mistral
+	private lastRequestTime: number = 0
 
 	constructor(options: ApiHandlerOptions) {
 		this.options = options
@@ -27,8 +28,20 @@ export class MistralHandler implements ApiHandler {
 		})
 	}
 
+	private async waitIfNeeded() {
+		const now = Date.now()
+		const timeSinceLastRequest = now - this.lastRequestTime
+		const minDelay = 30000 // 30 secondes en millisecondes
+		this.lastRequestTime = now
+
+		if (timeSinceLastRequest < minDelay) {
+			await new Promise((resolve) => setTimeout(resolve, minDelay - timeSinceLastRequest))
+		}
+	}
+
 	@withRetry()
 	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+		await this.waitIfNeeded()
 		const stream = await this.client.chat.stream({
 			model: this.getModel().id,
 			// max_completion_tokens: this.getModel().info.maxTokens,
